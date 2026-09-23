@@ -80,8 +80,13 @@ out
 
 # Nuxt.js build / generate output
 .nuxt
-dist
 .output
+
+# This package's built demo app (rebuilt by CI for GitHub Pages deploys).
+# Note: dist/ (the built *library*) is intentionally NOT ignored — it's
+# committed so `npm install github:DebunkTech/kenya-map` works with no
+# build step for consumers.
+dist-demo
 
 # Gatsby files
 .cache/
@@ -141,3 +146,7 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Raw boundary downloads used by the data pipeline (Phase 2) — large,
+# re-downloadable, and not needed once data/*.topojson is generated.
+data/raw/

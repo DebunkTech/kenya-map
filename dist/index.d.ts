@@ -30,7 +30,9 @@ export declare interface Dataset {
     label: string;
     /** Which drill-down level this dataset's `values` codes belong to. */
     level: AreaLevel;
+    /** One entry per area you have data for — areas you omit just render with `colors.noData`. */
     values: DatasetValueEntry[];
+    /** Numeric (gradient) or categorical (exact match) — see `NumericDatasetColors`/`CategoricalDatasetColors`. */
     colors: DatasetColors;
     /** Formats a raw value for display (legend, tooltip, default popup). Defaults to `value.toLocaleString()` for numbers and the raw string otherwise. */
     format?: (value: number | string) => string;
@@ -89,7 +91,20 @@ export declare interface KenyaMapProps {
      * value (or "No data").
      */
     renderPopup?: (area: AreaFeature, values: Record<string, DatasetPopupValue | undefined>) => ReactNode;
+    /**
+     * Any number of point-marker layers, drawn on top of the coloured areas
+     * (and unaffected by them — layers stay visible at every drill-down
+     * level, they're just repositioned by the same pan/zoom). Markers keep
+     * a constant on-screen size regardless of zoom.
+     */
+    pointLayers?: PointLayer[];
+    /** Renders checkboxes for showing/hiding each point layer. Ignored if `pointLayers` is empty. Visibility is internal (uncontrolled) — there's no equivalent to `selection`/`activeDatasetId` for it. */
+    showLayerToggles?: boolean;
+    /** Clicking a marker always opens its popup (separate from an area's popup — the two can be open at once). Omit for a default popup showing just the point's `label`. */
+    renderPointPopup?: (point: Point, layer: PointLayer) => ReactNode;
+    /** Applied to the outer container div. */
     className?: string;
+    /** Applied to the outer container div — set `width`/`height` here (or on a parent) if you're not relying on the default `width: 100%; height: 100%`. */
     style?: CSSProperties;
 }
 
@@ -99,6 +114,31 @@ export declare interface NumericDatasetColors {
     scale: string[];
     /** Fill for an area with no matching value. */
     noData: string;
+}
+
+/** One point marker. `lat`/`lng` place it on the map; `category`, if set, is looked up in its layer's `categoryColors` to override the layer's default `color`. `data` is yours — never read by this package except by whatever `renderPointPopup` you supply. */
+export declare interface Point {
+    /** Stable identifier — must be unique within its layer (used as the React key). */
+    id: string;
+    lat: number;
+    lng: number;
+    /** Shown on hover, in the default popup, and as the marker's aria-label. */
+    label: string;
+    category?: string;
+    data?: unknown;
+}
+
+/** A togglable group of point markers, drawn on top of the coloured areas. */
+export declare interface PointLayer {
+    /** Stable identifier — must be unique across `pointLayers` (used as the React key and by `showLayerToggles`). */
+    id: string;
+    /** Shown next to its checkbox in the layer toggles. */
+    label: string;
+    /** Default marker color for every point in this layer. */
+    color: string;
+    /** Per-category color override, keyed by `Point.category`. A point whose category isn't listed here (or has none) uses `color`. */
+    categoryColors?: Record<string, string>;
+    points: Point[];
 }
 
 /**

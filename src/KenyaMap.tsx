@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
 import { select } from "d3-selection";
-import { zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom";
-import type { GeoPath } from "d3-geo";
+import { zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior, type ZoomTransform } from "d3-zoom";
+import type { GeoPath, GeoProjection } from "d3-geo";
 
 import { useTopoJson } from "./useTopoJson";
 import { useMapMeta } from "./useMeta";
@@ -15,6 +15,8 @@ import {
   type DatasetPopupValue,
 } from "./datasets";
 import { DatasetSwitcher, Legend } from "./DatasetControls";
+import { colorForPoint, type Point, type PointLayer } from "./points";
+import { PointLayerToggles } from "./PointLayerControls";
 import type { AreaFeature, AreaLevel, RawAreaProperties, Selection } from "./types";
 
 export interface KenyaMapProps {
@@ -54,7 +56,20 @@ export interface KenyaMapProps {
    * value (or "No data").
    */
   renderPopup?: (area: AreaFeature, values: Record<string, DatasetPopupValue | undefined>) => ReactNode;
+  /**
+   * Any number of point-marker layers, drawn on top of the coloured areas
+   * (and unaffected by them — layers stay visible at every drill-down
+   * level, they're just repositioned by the same pan/zoom). Markers keep
+   * a constant on-screen size regardless of zoom.
+   */
+  pointLayers?: PointLayer[];
+  /** Renders checkboxes for showing/hiding each point layer. Ignored if `pointLayers` is empty. Visibility is internal (uncontrolled) — there's no equivalent to `selection`/`activeDatasetId` for it. */
+  showLayerToggles?: boolean;
+  /** Clicking a marker always opens its popup (separate from an area's popup — the two can be open at once). Omit for a default popup showing just the point's `label`. */
+  renderPointPopup?: (point: Point, layer: PointLayer) => ReactNode;
+  /** Applied to the outer container div. */
   className?: string;
+  /** Applied to the outer container div — set `width`/`height` here (or on a parent) if you're not relying on the default `width: 100%; height: 100%`. */
   style?: CSSProperties;
 }
 
@@ -107,6 +122,14 @@ interface PopupState {
   /** The clicked area's centroid in path-space (untransformed) — screen position is `transform.apply([cx, cy])`, recomputed every render, so the popup stays glued to the area through the zoom-in tween and any further pan/zoom. */
   cx: number;
   cy: number;
+}
+
+interface PointPopupState {
+  point: Point;
+  layer: PointLayer;
+  /** The point's projected path-space position (untransformed) — same `transform.apply` treatment as PopupState's cx/cy. */
+  x: number;
+  y: number;
 }
 
 function AreaLayer({
@@ -173,6 +196,89 @@ function AreaLayer({
       })}
     </g>
   );
+}
+
+const MARKER_RADIUS = 5;
+
+/**
+ * Point markers, rendered as a sibling of the areas' transformed `<g>`
+ * rather than inside it — each marker's *position* is computed by hand
+ * (`transform.apply(projection([lng, lat]))`, recomputed every render) so
+ * it moves with the map exactly like an area does, but its own `<circle>`
+ * radius is never inside a `scale(k)` transform, so it stays a constant
+ * size on screen regardless of zoom — unlike area strokes, which use
+ * `vector-effect: non-scaling-stroke` for the same visual effect because
+ * they *do* need to live inside that scaled group (their fill/outline is
+ * the zoomed shape itself).
+ */
+function PointMarkers({
+  layers,
+  hiddenLayerIds,
+  projection,
+  transform,
+  onHover,
+  onLeave,
+  onActivate,
+}: {
+  layers: PointLayer[];
+  hiddenLayerIds: Set<string>;
+  projection: GeoProjection;
+  transform: ZoomTransform;
+  onHover: (name: string, clientX: number, clientY: number) => void;
+  onLeave: () => void;
+  onActivate: (point: Point, layer: PointLayer) => void;
+}) {
+  return (
+    <g>
+      {layers
+        .filter((layer) => !hiddenLayerIds.has(layer.id))
+        .flatMap((layer) =>
+          layer.points.map((point) => {
+            const projected = projection([point.lng, point.lat]);
+            if (!projected) return null;
+            const [x, y] = transform.apply(projected);
+            return (
+              <circle
+                key={`${layer.id}:${point.id}`}
+                cx={x}
+                cy={y}
+                r={MARKER_RADIUS}
+                fill={colorForPoint(layer, point)}
+                stroke="#fff"
+                strokeWidth={1.5}
+                tabIndex={0}
+                role="button"
+                aria-label={point.label}
+                style={{ cursor: "pointer", outline: "none" }}
+                onMouseEnter={(event) => onHover(point.label, event.clientX, event.clientY)}
+                onMouseMove={(event) => onHover(point.label, event.clientX, event.clientY)}
+                onMouseLeave={onLeave}
+                onFocus={(event) => {
+                  const rect = event.currentTarget.getBoundingClientRect();
+                  onHover(point.label, rect.left + rect.width / 2, rect.top + rect.height / 2);
+                }}
+                onBlur={onLeave}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onActivate(point, layer);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    onActivate(point, layer);
+                  }
+                }}
+              />
+            );
+          }),
+        )}
+    </g>
+  );
+}
+
+function DefaultPointPopupContent({ point }: { point: Point }) {
+  return <div>{point.label}</div>;
 }
 
 function Popup({ x, y, onClose, children }: { x: number; y: number; onClose: () => void; children: ReactNode }) {
@@ -414,6 +520,24 @@ export function KenyaMap(props: KenyaMapProps) {
     [path, width, height, maxZoom],
   );
 
+  // Keeps the camera in sync with `selection`, regardless of *what*
+  // changed it — a click, the breadcrumb, or (in controlled mode) the
+  // consumer setting a new `selection` prop directly from outside, e.g.
+  // from external dropdowns, which has no click of its own to trigger a
+  // zoom otherwise. Whichever collection the deepest selected level's
+  // feature lives in might still be loading; this re-fires once it
+  // becomes ready, since that collection's state is a dependency.
+  useEffect(() => {
+    const feature = selection.ward
+      ? findFeature(wardsState.status === "ready" ? wardsState.data : undefined, selection.ward)
+      : selection.constituency
+        ? findFeature(constituenciesState.status === "ready" ? constituenciesState.data : undefined, selection.constituency)
+        : selection.county
+          ? findFeature(countiesState.status === "ready" ? countiesState.data : undefined, selection.county)
+          : undefined;
+    zoomTo(feature);
+  }, [selection.county, selection.constituency, selection.ward, countiesState, constituenciesState, wardsState, zoomTo]);
+
   // Whether clicking an area should also open a popup for it — only when
   // there's something to put in one, so a consumer who hasn't touched any
   // Phase 4 props sees exactly the Phase 3 click behavior (drill down,
@@ -426,22 +550,53 @@ export function KenyaMap(props: KenyaMapProps) {
   // on an area (which opens/replaces the popup) is *inside* the
   // container, so `contains` correctly leaves it alone — this only fires
   // for clicks on the rest of the host page.
+  const pointLayers = props.pointLayers;
+  const [pointPopup, setPointPopup] = useState<PointPopupState | null>(null);
+  const closePointPopup = useCallback(() => setPointPopup(null), []);
+  // Visibility per layer is internal-only (no controlled equivalent to
+  // `selection`/`activeDatasetId`) — a checkbox toggling a layer on/off is
+  // squarely local UI state, not something a parent needs to drive.
+  const [hiddenLayerIds, setHiddenLayerIds] = useState<Set<string>>(() => new Set());
+  const toggleLayer = useCallback((id: string) => {
+    setHiddenLayerIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+  // A marker's own popup is separate from an area's (per PointLayer docs
+  // above) — clicking one always opens it, no gating like `popupsEnabled`
+  // above, since there's no pre-Phase-5 click behavior on markers to
+  // preserve.
+  const activatePoint = useCallback(
+    (point: Point, layer: PointLayer) => {
+      if (!projection) return;
+      const projected = projection([point.lng, point.lat]);
+      if (!projected) return;
+      setPointPopup({ point, layer, x: projected[0], y: projected[1] });
+    },
+    [projection],
+  );
+
   useEffect(() => {
-    if (!popup) return;
+    if (!popup && !pointPopup) return;
     function handleOutsideClick(event: MouseEvent) {
       if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
         closePopup();
+        closePointPopup();
       }
     }
     document.addEventListener("click", handleOutsideClick);
     return () => document.removeEventListener("click", handleOutsideClick);
-  }, [popup, closePopup]);
+  }, [popup, pointPopup, closePopup, closePointPopup]);
 
   // A click always selects the clicked area at *its own* level, regardless
   // of which layer it's in or how faded it currently is — a sibling
   // constituency, a faded county, or another ward in the same constituency
-  // are all just "select this area, drop anything below it, zoom to it."
-  // With datasets/popups configured, it also opens that area's popup.
+  // are all just "select this area, drop anything below it, zoom to it
+  // (via the selection-driven effect above)." With datasets/popups
+  // configured, it also opens that area's popup.
   const selectArea = useCallback(
     (feature: GeoJSON.Feature, level: AreaLevel) => {
       const p = areaProps(feature);
@@ -452,36 +607,27 @@ export function KenyaMap(props: KenyaMapProps) {
             ? { county: p.county_code, constituency: p.code }
             : { county: p.county_code, constituency: p.constituency_code, ward: p.code };
       setSelection(next);
-      zoomTo(feature);
       if (popupsEnabled && path) {
         const [cx, cy] = path.centroid(feature);
         setPopup({ area: toAreaFeature(feature, level), cx, cy });
       }
     },
-    [setSelection, zoomTo, popupsEnabled, path],
+    [setSelection, popupsEnabled, path],
   );
   const goToConstituency = useCallback(() => {
     if (!selection.county || !selection.constituency) return;
     setSelection({ county: selection.county, constituency: selection.constituency });
-    zoomTo(
-      findFeature(
-        constituenciesState.status === "ready" ? constituenciesState.data : undefined,
-        selection.constituency,
-      ),
-    );
     closePopup();
-  }, [setSelection, zoomTo, closePopup, selection.county, selection.constituency, constituenciesState]);
+  }, [setSelection, closePopup, selection.county, selection.constituency]);
   const goToCounty = useCallback(() => {
     if (!selection.county) return;
     setSelection({ county: selection.county });
-    zoomTo(findFeature(countiesState.status === "ready" ? countiesState.data : undefined, selection.county));
     closePopup();
-  }, [setSelection, zoomTo, closePopup, selection.county, countiesState]);
+  }, [setSelection, closePopup, selection.county]);
   const goToCountry = useCallback(() => {
     setSelection({});
-    zoomTo(undefined);
     closePopup();
-  }, [setSelection, zoomTo, closePopup]);
+  }, [setSelection, closePopup]);
   const goUp = useCallback(() => {
     if (selection.ward) goToConstituency();
     else if (selection.constituency) goToCounty();
@@ -512,6 +658,7 @@ export function KenyaMap(props: KenyaMapProps) {
   // this is what keeps the popup glued to its area through the zoom-in
   // tween and any further pan/zoom, see PopupState's cx/cy comment.
   const [popupScreenX, popupScreenY] = popup ? transform.apply([popup.cx, popup.cy]) : [0, 0];
+  const [pointPopupScreenX, pointPopupScreenY] = pointPopup ? transform.apply([pointPopup.x, pointPopup.y]) : [0, 0];
 
   return (
     <div
@@ -521,9 +668,11 @@ export function KenyaMap(props: KenyaMapProps) {
       onKeyDown={(event) => {
         if (event.key === "Escape") {
           event.preventDefault();
-          // Escape closes the topmost thing first: an open popup, then
-          // (on a second press) steps up a drill-down level.
-          if (popup) closePopup();
+          // Escape closes the topmost thing first: a marker's popup, then
+          // an area's, then (once neither is open) steps up a drill-down
+          // level.
+          if (pointPopup) closePointPopup();
+          else if (popup) closePopup();
           else goUp();
         }
       }}
@@ -592,6 +741,11 @@ export function KenyaMap(props: KenyaMapProps) {
           <Legend dataset={activeDataset} />
         </div>
       )}
+      {props.showLayerToggles && pointLayers && pointLayers.length > 0 && (
+        <div style={{ position: "absolute", bottom: 8, left: 8, zIndex: 1 }}>
+          <PointLayerToggles layers={pointLayers} hiddenLayerIds={hiddenLayerIds} onToggle={toggleLayer} />
+        </div>
+      )}
 
       {countiesState.status === "loading" && <LayerMessage>Loading map…</LayerMessage>}
       {countiesState.status === "error" && (
@@ -656,6 +810,7 @@ export function KenyaMap(props: KenyaMapProps) {
               // that ends a pan/zoom drag — both fire a click event here.
               if (moved < 4) {
                 closePopup();
+                closePointPopup();
                 goUp();
               }
             }}
@@ -696,6 +851,17 @@ export function KenyaMap(props: KenyaMapProps) {
               />
             )}
           </g>
+          {pointLayers && pointLayers.length > 0 && projection && (
+            <PointMarkers
+              layers={pointLayers}
+              hiddenLayerIds={hiddenLayerIds}
+              projection={projection}
+              transform={transform}
+              onHover={handleHover}
+              onLeave={handleLeave}
+              onActivate={activatePoint}
+            />
+          )}
         </svg>
       )}
 
@@ -729,6 +895,16 @@ export function KenyaMap(props: KenyaMapProps) {
           )}
         </Popup>
       )}
+
+      {pointPopup && (
+        <Popup x={pointPopupScreenX} y={pointPopupScreenY} onClose={closePointPopup}>
+          {props.renderPointPopup ? (
+            props.renderPointPopup(pointPopup.point, pointPopup.layer)
+          ) : (
+            <DefaultPointPopupContent point={pointPopup.point} />
+          )}
+        </Popup>
+      )}
     </div>
   );
 }
@@ -752,6 +928,6 @@ const resetButtonStyle: CSSProperties = {
   padding: "2px 8px",
   borderRadius: 4,
   border: "1px solid var(--kenya-map-stroke, #71717a)",
-  background: "var(--kenya-map-fill, #fff)",
+  background: "var(--kenya-map-panel-bg, #fff)",
   cursor: "pointer",
 };

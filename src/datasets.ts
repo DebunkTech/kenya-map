@@ -38,7 +38,9 @@ export interface Dataset {
   label: string;
   /** Which drill-down level this dataset's `values` codes belong to. */
   level: AreaLevel;
+  /** One entry per area you have data for — areas you omit just render with `colors.noData`. */
   values: DatasetValueEntry[];
+  /** Numeric (gradient) or categorical (exact match) — see `NumericDatasetColors`/`CategoricalDatasetColors`. */
   colors: DatasetColors;
   /** Formats a raw value for display (legend, tooltip, default popup). Defaults to `value.toLocaleString()` for numbers and the raw string otherwise. */
   format?: (value: number | string) => string;

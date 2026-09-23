@@ -9,3 +9,4 @@ export type {
   CategoricalDatasetColors,
   DatasetPopupValue,
 } from "./datasets";
+export type { Point, PointLayer } from "./points";

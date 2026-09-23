@@ -33,12 +33,13 @@ export declare interface KenyaMapProps {
 /**
  * Which area is currently drilled into. `undefined` (or an empty object)
  * means the whole-country view. Setting `constituency` without `county`
- * is not a valid state — a constituency is only reachable through its
- * county.
+ * (or `ward` without `constituency`) is not a valid state — each level is
+ * only reachable through its parent.
  */
 declare interface Selection_2 {
     county?: string;
     constituency?: string;
+    ward?: string;
 }
 export { Selection_2 as Selection }
 

@@ -4,12 +4,13 @@ export type AreaLevel = "county" | "constituency" | "ward";
 /**
  * Which area is currently drilled into. `undefined` (or an empty object)
  * means the whole-country view. Setting `constituency` without `county`
- * is not a valid state — a constituency is only reachable through its
- * county.
+ * (or `ward` without `constituency`) is not a valid state — each level is
+ * only reachable through its parent.
  */
 export interface Selection {
   county?: string;
   constituency?: string;
+  ward?: string;
 }
 
 /** A single boundary feature (county, constituency or ward) with its geometry stripped to just identity/lineage. */

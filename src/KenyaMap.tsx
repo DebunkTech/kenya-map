@@ -4,8 +4,9 @@ import { zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom
 import type { GeoPath } from "d3-geo";
 
 import { useTopoJson } from "./useTopoJson";
-import { createPathGenerator, createProjection, tweenZoomTo, zoomTransformForBounds } from "./geo";
-import type { RawAreaProperties, Selection } from "./types";
+import { useMapMeta } from "./useMeta";
+import { createPathGenerator, createProjection, maxZoomForBBox, tweenZoomTo, zoomTransformForBounds } from "./geo";
+import type { AreaLevel, RawAreaProperties, Selection } from "./types";
 
 export interface KenyaMapProps {
   /**
@@ -23,7 +24,9 @@ export interface KenyaMapProps {
 }
 
 const DEFAULT_BOUNDARIES_BASE_URL = "https://cdn.jsdelivr.net/gh/DebunkTech/kenya-map@v0.1.0/data";
-const MAX_ZOOM = 12;
+// Used only until data/meta.json loads (typically milliseconds — it's a
+// ~200 byte fetch issued alongside counties.topojson) or if it fails to.
+const FALLBACK_MAX_ZOOM = 12;
 
 function useElementSize(ref: RefObject<HTMLElement | null>): { width: number; height: number } {
   const [size, setSize] = useState({ width: 0, height: 0 });
@@ -63,7 +66,6 @@ function AreaLayer({
   features,
   path,
   opacity,
-  interactive,
   focusable,
   onHover,
   onLeave,
@@ -72,8 +74,12 @@ function AreaLayer({
   features: GeoJSON.Feature[];
   path: GeoPath;
   opacity: number;
-  interactive: boolean;
-  /** Whether this layer takes tab stops. Not the same as `interactive` — wards are focusable (so keyboard users can reach their tooltip) but don't drill down further, so they're not interactive. Faded layers we've drilled past are neither. */
+  /**
+   * Whether this layer takes tab stops. Every layer is clickable
+   * (including faded ones — clicking a faded area switches to it, per
+   * user testing feedback), but keyboard Tab only reaches the current,
+   * unfaded layer — faded areas stay reachable by mouse only.
+   */
   focusable: boolean;
   onHover: (name: string, clientX: number, clientY: number) => void;
   onLeave: () => void;
@@ -88,6 +94,7 @@ function AreaLayer({
         return (
           <path
             key={properties.code}
+            className="kenya-map-area"
             d={d}
             fill="var(--kenya-map-fill, #d4d4d8)"
             stroke="var(--kenya-map-stroke, #71717a)"
@@ -95,7 +102,7 @@ function AreaLayer({
             tabIndex={focusable ? 0 : -1}
             role="button"
             aria-label={properties.name}
-            style={{ cursor: interactive ? "pointer" : "default", outlineOffset: 2 }}
+            style={{ cursor: "pointer", outline: "none" }}
             onMouseEnter={(event) => onHover(properties.name, event.clientX, event.clientY)}
             onMouseMove={(event) => onHover(properties.name, event.clientX, event.clientY)}
             onMouseLeave={onLeave}
@@ -104,9 +111,9 @@ function AreaLayer({
               onHover(properties.name, rect.left + rect.width / 2, rect.top + rect.height / 2);
             }}
             onBlur={onLeave}
-            onClick={interactive ? () => onActivate(feature) : undefined}
+            onClick={() => onActivate(feature)}
             onKeyDown={(event) => {
-              if (interactive && event.key === "Enter") {
+              if (focusable && event.key === "Enter") {
                 event.preventDefault();
                 onActivate(feature);
               }
@@ -165,6 +172,7 @@ export function KenyaMap(props: KenyaMapProps) {
   const [wardsState, retryWards] = useTopoJson(
     selection.county ? `${boundariesBaseUrl}/wards/${selection.county}.topojson` : null,
   );
+  const metaState = useMapMeta(boundariesBaseUrl);
 
   const countyFeatures = countiesState.status === "ready" ? countiesState.data.features : [];
   const constituencyFeatures = useMemo(() => {
@@ -182,48 +190,76 @@ export function KenyaMap(props: KenyaMapProps) {
   }, [countiesState, width, height]);
   const path = useMemo(() => (projection ? createPathGenerator(projection) : null), [projection]);
 
+  // The max zoom level: computed so the country's smallest ward can just
+  // fill the viewport, using the bounds shipped in data/meta.json. Falls
+  // back to a fixed default only until that tiny fetch resolves.
+  const maxZoom = useMemo(() => {
+    if (!path || width === 0 || height === 0 || metaState.status !== "ready") return FALLBACK_MAX_ZOOM;
+    return Math.max(1, maxZoomForBBox(path, metaState.data.maxZoomWard.bbox, width, height));
+  }, [path, width, height, metaState]);
+
   const svgRef = useRef<SVGSVGElement>(null);
   const zoomBehaviorRef = useRef<ZoomBehavior<SVGSVGElement, unknown> | null>(null);
+  const dragStartRef = useRef<{ x: number; y: number } | null>(null);
   const [transform, setTransform] = useState(zoomIdentity);
 
   useEffect(() => {
     const svg = svgRef.current;
     if (!svg || width === 0 || height === 0) return;
     const behavior = zoom<SVGSVGElement, unknown>()
-      .scaleExtent([1, MAX_ZOOM])
+      .scaleExtent([1, maxZoom])
       .on("zoom", (event: D3ZoomEvent<SVGSVGElement, unknown>) => setTransform(event.transform));
     zoomBehaviorRef.current = behavior;
     select(svg).call(behavior);
     return () => {
       select(svg).on(".zoom", null);
     };
-  }, [width, height]);
+    // maxZoom changes at most once in practice (fallback -> real value,
+    // once meta.json resolves), so this only rebinds twice on mount, not
+    // continuously — see the comment on FALLBACK_MAX_ZOOM.
+  }, [width, height, maxZoom]);
 
   const zoomTo = useCallback(
     (feature: GeoJSON.Feature | undefined) => {
       const svg = svgRef.current;
       const behavior = zoomBehaviorRef.current;
       if (!svg || !behavior || !path) return;
-      const target = feature ? zoomTransformForBounds(path, feature, width, height, MAX_ZOOM) : zoomIdentity;
+      // Same maxZoom as the wheel/pinch scaleExtent above, so a click-zoom
+      // never lands somewhere scrolling would then snap back from.
+      const target = feature ? zoomTransformForBounds(path, feature, width, height, maxZoom) : zoomIdentity;
       tweenZoomTo(svg, behavior, target);
     },
-    [path, width, height],
+    [path, width, height, maxZoom],
   );
 
-  const selectCounty = useCallback(
-    (feature: GeoJSON.Feature) => {
-      setSelection({ county: areaProps(feature).code });
+  // A click always selects the clicked area at *its own* level, regardless
+  // of which layer it's in or how faded it currently is — a sibling
+  // constituency, a faded county, or another ward in the same constituency
+  // are all just "select this area, drop anything below it, zoom to it."
+  const selectArea = useCallback(
+    (feature: GeoJSON.Feature, level: AreaLevel) => {
+      const p = areaProps(feature);
+      const next: Selection =
+        level === "county"
+          ? { county: p.code }
+          : level === "constituency"
+            ? { county: p.county_code, constituency: p.code }
+            : { county: p.county_code, constituency: p.constituency_code, ward: p.code };
+      setSelection(next);
       zoomTo(feature);
     },
     [setSelection, zoomTo],
   );
-  const selectConstituency = useCallback(
-    (feature: GeoJSON.Feature) => {
-      setSelection({ county: selection.county, constituency: areaProps(feature).code });
-      zoomTo(feature);
-    },
-    [setSelection, zoomTo, selection.county],
-  );
+  const goToConstituency = useCallback(() => {
+    if (!selection.county || !selection.constituency) return;
+    setSelection({ county: selection.county, constituency: selection.constituency });
+    zoomTo(
+      findFeature(
+        constituenciesState.status === "ready" ? constituenciesState.data : undefined,
+        selection.constituency,
+      ),
+    );
+  }, [setSelection, zoomTo, selection.county, selection.constituency, constituenciesState]);
   const goToCounty = useCallback(() => {
     if (!selection.county) return;
     setSelection({ county: selection.county });
@@ -234,9 +270,10 @@ export function KenyaMap(props: KenyaMapProps) {
     zoomTo(undefined);
   }, [setSelection, zoomTo]);
   const goUp = useCallback(() => {
-    if (selection.constituency) goToCounty();
+    if (selection.ward) goToConstituency();
+    else if (selection.constituency) goToCounty();
     else if (selection.county) goToCountry();
-  }, [selection.constituency, selection.county, goToCounty, goToCountry]);
+  }, [selection.ward, selection.constituency, selection.county, goToConstituency, goToCounty, goToCountry]);
 
   const [hover, setHover] = useState<HoverInfo | null>(null);
   const handleHover = useCallback((name: string, clientX: number, clientY: number) => {
@@ -298,7 +335,13 @@ export function KenyaMap(props: KenyaMapProps) {
           {selection.constituency && (
             <>
               <span aria-hidden="true">›</span>
-              <span style={{ fontWeight: 600 }}>{constituencyName ?? selection.constituency}</span>
+              <button
+                type="button"
+                onClick={goToConstituency}
+                style={breadcrumbButtonStyle(!selection.ward)}
+              >
+                {constituencyName ?? selection.constituency}
+              </button>
             </>
           )}
         </nav>
@@ -347,28 +390,51 @@ export function KenyaMap(props: KenyaMapProps) {
           role="img"
           aria-label="Map of Kenya"
         >
-          <rect x={0} y={0} width={width} height={height} fill="transparent" />
+          <style>{`
+            .kenya-map-area {
+              vector-effect: non-scaling-stroke;
+            }
+            .kenya-map-area:focus-visible {
+              stroke: var(--kenya-map-focus-color, #2563eb);
+              stroke-width: 3;
+            }
+          `}</style>
+          <rect
+            x={0}
+            y={0}
+            width={width}
+            height={height}
+            fill="transparent"
+            onPointerDown={(event) => {
+              dragStartRef.current = { x: event.clientX, y: event.clientY };
+            }}
+            onClick={(event) => {
+              const start = dragStartRef.current;
+              const moved = start ? Math.hypot(event.clientX - start.x, event.clientY - start.y) : 0;
+              // Distinguish a genuine click on empty space from the mouseup
+              // that ends a pan/zoom drag — both fire a click event here.
+              if (moved < 4) goUp();
+            }}
+          />
           <g transform={`translate(${transform.x},${transform.y}) scale(${transform.k})`}>
             <AreaLayer
               features={countyFeatures}
               path={path}
               opacity={selection.county ? 0.25 : 1}
-              interactive={!selection.county}
               focusable={!selection.county}
               onHover={handleHover}
               onLeave={handleLeave}
-              onActivate={selectCounty}
+              onActivate={(feature) => selectArea(feature, "county")}
             />
             {selection.county && (
               <AreaLayer
                 features={constituencyFeatures}
                 path={path}
                 opacity={selection.constituency ? 0.25 : 1}
-                interactive={!selection.constituency}
                 focusable={!selection.constituency}
                 onHover={handleHover}
                 onLeave={handleLeave}
-                onActivate={selectConstituency}
+                onActivate={(feature) => selectArea(feature, "constituency")}
               />
             )}
             {selection.constituency && (
@@ -376,11 +442,10 @@ export function KenyaMap(props: KenyaMapProps) {
                 features={wardFeatures}
                 path={path}
                 opacity={1}
-                interactive={false}
                 focusable={true}
                 onHover={handleHover}
                 onLeave={handleLeave}
-                onActivate={() => {}}
+                onActivate={(feature) => selectArea(feature, "ward")}
               />
             )}
           </g>

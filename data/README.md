@@ -8,14 +8,32 @@ the output needs to change.
 - `constituencies.topojson` — 290 constituencies, each with a `county_code`
 - `wards/{county_code}.topojson` — 1,450 wards, split per county for lazy
   loading, each with `county_code` and `constituency_code`
-- `codes.json` — a flat list of every area (`code`, `name`, `level`, and
-  parent codes), for looking up codes when preparing your own datasets.
-  **This file is for you, at data-prep time — the `<KenyaMap />` component
-  itself never fetches or loads it.**
+- `codes.json` — a flat list of every area (`code`, `name`, `level`, parent
+  codes, and `alt_names` when the area has one — see below), for looking up
+  codes when preparing your own datasets. **This file is for you, at
+  data-prep time — the `<KenyaMap />` component itself never fetches or
+  loads it.**
+- `meta.json` — small, **the component does fetch this one**. Currently
+  just `maxZoomWard`: the smallest ward's code, name and geographic bbox,
+  computed by the pipeline (not otherwise derivable at runtime, since wards
+  load lazily one county at a time). Used to cap zoom at "the smallest ward
+  fills the view," instead of a fixed zoom number that's either too
+  restrictive for small wards or lets you overzoom past everything else.
 
 Every feature's properties are normalised to just `code`, `name`, and parent
 codes. Codes are zero-padded strings: 3 digits for counties and
-constituencies, 4 for wards.
+constituencies, 4 for wards — and, for wards and constituencies, are the
+**official IEBC codes** (see "Adopting official IEBC ward codes and names"
+below), so external IEBC-sourced datasets can be joined directly by code.
+County codes were already official IEBC numbering (verified below).
+
+**`alt_names`** (in `codes.json` only, never in the shipped TopoJSON): every
+constituency and ward's `name` is the current official 2022 spelling; where
+the source shapefile used a different spelling or an older name, that
+original is kept as `alt_names` (an array, for searchability — e.g. so a
+search box can still find "Mbita" for what's now displayed as "Suba North")
+rather than discarded. Absent (or `[]`) when the source name already matched
+exactly. Not applied to counties — see below.
 
 ## The code is MIT; the boundary data is not
 
@@ -29,8 +47,9 @@ terms travel with it independently of this package's MIT license.
 
 | Level | Dataset | Publisher (attribute to) | License |
 |---|---|---|---|
-| Counties, constituencies (names/codes only — see below) | [Kenya Admin Boundaries - Election Polling stations](https://data.humdata.org/dataset/kenya-elections) | IEBC, via OCHA ROSEA | "Other" (legacy OCHA terms, non-commercial) |
+| Counties, constituencies (names/codes only — see below); also this dataset's own ward file, used only to cross-check ward→constituency assignment (see below) | [Kenya Admin Boundaries - Election Polling stations](https://data.humdata.org/dataset/kenya-elections) | IEBC, via OCHA ROSEA | "Other" (legacy OCHA terms, non-commercial) |
 | Wards (geometry for all three levels — see below) | [Administrative Wards in Kenya 1450](https://data.humdata.org/dataset/administrative-wards-in-kenya-1450) | American Red Cross | CC BY 4.0 International |
+| Official codes/names for constituencies and wards, and ward→constituency verification — not geometry, see below | "Registered Voters per County Assembly Ward, 2022 General Election" (`data/reference/iebc-2022-registered-voters-per-caw.txt`) | IEBC | Official government publication |
 
 **Election dataset ("Other" license).** HDX links this dataset's license to
 a legacy [HumanitarianResponse.info terms page](https://web.archive.org/web/2022id_/https://data.humdata.org/about/license/legacy_hrinfo)
@@ -149,19 +168,314 @@ load stays at counties.topojson alone.
 The wards dataset has no constituency code of its own — only a free-text
 `subcounty` name that doesn't map 1:1 to the 290 constituencies (302 unique
 subcounty names exist in the source). Each ward's `constituency_code` (and
-`county_code`) is instead assigned by a spatial join: testing the ward's
-centroid for containment in each constituency polygon from constituencies.
-zip (`d3.geoContains`).
+`county_code`) starts from a spatial join: testing the ward's centroid for
+containment in each constituency polygon from constituencies.zip
+(`d3.geoContains`).
 
 One ward's centroid falls outside every constituency polygon (likely a
 concave-boundary edge case): **"Moyale Township"**, assigned instead to the
 nearest constituency by centroid distance — **Moyale (code 045)**. Worth a
 visual spot-check if you're auditing this pipeline's output.
 
-Ward codes themselves are assigned by the pipeline (sequential, sorted by
-county → constituency → name) since the source has no usable official
-code — they are **not** official IEBC ward codes, unlike county and
-constituency codes.
+**The spatial join alone gets some wards wrong.** Testing it against the
+election dataset's own ward file (`ward.results.zip` — same "Kenya
+Elections" HDX dataset as constituencies.zip, so its `CONSTITUEN` attribute
+per ward is a same-vintage, independent cross-check) found 38 of 1,450
+wards where they disagreed — genuine boundary misalignment between the
+2016 wards dataset and the 2018 constituencies dataset, not a bug in the
+containment test itself. One case (Nairobi's "South C") was checked by
+hand: even assigning by *area of overlap* rather than centroid still put
+68% of the ward's area inside the wrong constituency (Embakasi South)
+against the election dataset's boundary — the two datasets' boundary
+lines themselves don't coincide closely enough there for any purely
+geometric method to get it right. A name-based cross-check is used
+instead: **the pipeline downloads `ward.results.zip` as a fourth source**,
+and for any ward it can confidently match to exactly one entry there (same
+county, same name, allowing for the election file's own minor typos when
+that's unambiguously the closest match among that county's real
+constituencies), the election file's `CONSTITUEN` overrides the spatial
+join's result.
+
+That override is not applied blindly, though — **the election file has
+its own errors too.** Every one of the 38 disagreements was independently
+checked (a background research pass against Wikipedia constituency/ward
+pages and official NGCDF constituency sites, then a second, more
+authoritative check below) before being trusted. 6 of the 38 turned out to
+be errors in the election file itself, not the spatial join — for those,
+the spatial join's original (correct) answer is kept, via a small
+hardcoded exclusion list in `scripts/lib/election-ward-crosscheck.mjs`:
+
+| Ward | County | Election file wrongly claimed | Actually |
+|---|---|---|---|
+| Kabiro | Nairobi | Dagoretti South | **Dagoretti North** |
+| Kawangware | Nairobi | Dagoretti South | **Dagoretti North** |
+| Kiagu | Meru | Buuri | **Central Imenti** |
+| Kiomo/Kyethani | Kitui | Mwingi Central | **Mwingi West** |
+| Mulango | Kitui | Kitui Rural | **Kitui Central** |
+| Ildamat | Narok | Narok South | **Narok East** |
+
+The other 32 disagreements were confirmed correct in the election file and
+applied.
+
+**A second, more authoritative cross-check** followed: Kenya's official
+"Registered Voters per County Assembly Ward, 2022 General Election" list —
+every ward, with both county/constituency/ward **codes** and names,
+published by IEBC. It isn't available at a stable download URL (it reached
+this project as a user-supplied PDF), so the pipeline can't fetch it
+automatically the way it does the other sources. It's transcribed
+verbatim (county code/name, constituency code/name, CAW code/name,
+registered voters — one row per ward, space-separated) to
+`data/reference/iebc-2022-registered-voters-per-caw.txt`, committed (unlike
+`data/raw/`, `data/reference/` is **not** git-ignored — see that folder's
+own README) since, unlike the other raw sources, it can't be re-downloaded
+if lost. Unlike the first pass, this one **is** read by the pipeline itself
+at build time (`scripts/lib/iebc-reference.mjs`), both to verify codes and,
+below, to adopt official ward codes/names directly — the individually
+-verified ward*→*constituency reassignments it found are still hardcoded
+in `scripts/lib/election-ward-crosscheck.mjs`, each citing this source.
+
+Its constituency codes match ours exactly (verified across all 290 — e.g.
+Nairobi's 17 constituencies are 274–290 in both; the pipeline asserts this
+on every run, see `verifyCodesMatchIebc` in `scripts/lib/iebc-reference.mjs`
+— a handful of source-shapefile name typos and pre-2022 constituency names
+need a small alias table to pair up for this check, since it matches by
+name; see `NAME_ALIASES` in `scripts/build-data.mjs`). County codes match
+too (also asserted every run). Matching our 1,450 wards to the list by
+(county, ward name) matched 1,342 confidently, found **zero remaining
+disagreements** among those 1,342 after the fixes below, and surfaced
+problems the 2017 election file had missed or gotten wrong itself:
+
+| Ward | County | Was | Now | Note |
+|---|---|---|---|---|
+| Sabaki | Kilifi | Malindi | **Magarini** | missed by the 2017 cross-check entirely |
+| Fino | Mandera | Mandera East | **Lafey** | the 2017-based fix above was itself wrong; this reverts it |
+| Libehia | Mandera | Lafey | **Mandera East** | missed by the 2017 cross-check |
+| Gaturi North | Embu | Manyatta | **Runyenjes** | missed by the 2017 cross-check |
+| Umande | Laikipia | Laikipia North | **Laikipia East** | missed by the 2017 cross-check |
+| London | Nakuru | Nakuru Town East | **Nakuru Town West** | missed by the 2017 cross-check |
+| Nyalenda A | Kisumu | Kisumu Central | **Kisumu East** | missed by the 2017 cross-check |
+| Nyayo Highrise | Nairobi | Kibra | **Langata** | missed entirely — this is the ward a user spot-check found "missing" from Langata; it wasn't missing, it was misfiled under Kibra |
+
+The Nyayo Highrise case (and every other Nairobi ward) was initially
+invisible to this check for an unrelated reason worth recording: our
+counties are named e.g. "Nairobi", but the 2022 list calls it
+"NAIROBI CITY" — all 85 Nairobi wards silently failed to match until the
+comparison script's county-name normalization was taught to ignore
+"CITY"/"COUNTY" as noise words, the same way it already ignores "WARD" on
+ward names.
+
+**A separate, more fundamental bug surfaced during this pass**, unrelated
+to the ward-level cross-check: constituency 148 ("Marakwet West") carries
+`COUNTY_NAM`/`COUNTY_COD` **"WEST POKOT"/24** in the constituencies.zip
+shapefile itself — verified directly in the raw source, not a pipeline
+bug — even though it's really in Elgeyo-Marakwet (28); its sibling
+Marakwet East (147) correctly shows Elgeyo-Marakwet, and the 2022 list
+confirms county 028 for constituency 148. Left uncorrected, this
+mislabeled the *county* (not just the constituency) for every ward
+genuinely inside Marakwet West's shape — Arror, Cherangany, Kapsowar,
+Moiben/Kuserwo, Sengwer, and one of two coincidentally-same-named wards
+called "Lelan" (West Pokot's real Pokot South constituency has its own,
+different, "Lelan") — and caused the two Lelan wards to collide during
+name-matching, both wrongly landing in Pokot South. Fixed with a one-line
+county-code correction in the pipeline (`CONSTITUENCY_COUNTY_CODE_FIXES`),
+which fixed all six wards and correctly split the two Lelans apart.
+
+Two more corrections came from the same 2022 list, not ward
+misassignments but **stale/misspelled constituency names**: constituencies
+251/252 are named "Mbita"/"Suba" in the 2018-vintage constituencies.zip,
+renamed "Suba North"/"Suba South" by 2022 (same codes, confirmed by the
+2022 list) — and constituency 222 is spelled "WEBUTE WEST" in the source
+(a typo — its neighbour in the same file is correctly "WEBUYE EAST", and
+the 2022 list confirms "WEBUYE WEST"). These no longer need a hardcoded
+fix: every constituency's `name` is now unconditionally taken from the
+2022 list (see "Adopting official IEBC ward codes and names" below), so
+this and every other constituency naming difference is corrected the same
+way, with the source name preserved as `alt_names`.
+
+After all the fixes above, every constituency's ward count was re-checked
+for outliers (a suspiciously low or high count, the way this whole
+investigation started — Dagoretti North dropping to 3 wards after the
+2017 election file's own Kabiro/Kawangware error). The distribution at
+that point was 3–8 wards per constituency, smoothly distributed, summing
+to exactly 1,450 — no remaining outliers. A further, more precise
+count-mismatch check followed once ward-level codes were adopted directly
+from the 2022 list — see below.
+
+## Adopting official IEBC ward codes and names
+
+Earlier versions of this pipeline assigned wards their own sequential,
+non-official codes, since the source data has no usable ward code of its
+own. Wards now instead carry the **official IEBC CAW (County Assembly
+Ward) code** from the 2022 list, matched one constituency at a time
+(`matchWardsWithinConstituency` in `scripts/lib/iebc-reference.mjs`) —
+scoped to a single (already-verified-correct) constituency at a time, and
+never across constituencies or by fuzzy constituency-name matching, which
+is what let the ward.results.zip cross-check above go wrong. Four passes,
+each only touching what the previous one left unmatched:
+
+1. **Exact**, word-order-independent name match (e.g. handles our "Ganjoni
+   Ward-Shimanzi" vs. the official "Shimanzi/Ganjoni").
+2. **Squash**: the same idea but without splitting into words at all —
+   catches a compound word on one side matching the same word split by a
+   separator on the other (our "Oldonyiro" vs. official "OLDO/NYIRO"),
+   which word-sorting alone can't fix since it only reorders whole tokens.
+3. **Fuzzy**: edit distance ≤3 on the squashed name, only when there's a
+   single unambiguous closest candidate — absorbs typos/transliteration
+   drift between the 2016 source and the 2022 official spelling (our
+   "Kaagari North" vs. official "KAGAARI NORTH", our
+   "Chemundu/kapng'etunyi" vs. official "CHEMUNDU/KAPNG'ETUNY"). Safe here
+   specifically because it's scoped to one constituency's typically 3-9
+   wards, not compared across all 1,450 nationally.
+4. **Elimination**: if exactly one ward is left over on *both* sides after
+   1-3, they're paired regardless of how different the names look — not a
+   guess: with every other ward in the constituency already confidently
+   matched and the constituency's official and our ward counts equal, the
+   one remaining pair must correspond (this also catches outright renames,
+   not just spelling drift). Only ever applied 1-vs-1; two or more
+   simultaneous leftovers on each side are ambiguous and are left
+   unmatched rather than guessed at.
+
+**Result: 1,448 of 1,450 wards matched** (12 of those by elimination). The
+source (Red Cross wards.zip) name is kept as `alt_names` wherever it
+differs from the adopted official name.
+
+**Ward-count mismatches investigated.** Before the matching above, every
+constituency's raw ward count was compared against the official list's —
+initially 18 constituencies disagreed. Each was investigated individually
+(cross-referencing the unmatched ward's name against the *entire* national
+list, not just its own constituency) and fell into one of three buckets:
+
+- **Genuine cross-constituency misassignment (6 wards, fixed):** the
+  ward's official CAW name is an *exact* match somewhere else in the
+  country, not a spelling variant of anything in its assigned
+  constituency — meaning the spatial/election-file join from the section
+  above simply put it in the wrong constituency. Added to
+  `MANUAL_WARD_CORRECTIONS` in `scripts/lib/election-ward-crosscheck.mjs`,
+  the same mechanism as the 8 corrections above, sourced from the same
+  2022 list:
+
+  | Ward | County | Was | Now |
+  |---|---|---|---|
+  | Athi River | Kajiado | Kajiado East | **Mavoko** |
+  | Bukhayo North/Walatsi | Busia | Teso South | **Nambale** |
+  | Kalama | (moves county too: Makueni → **Machakos**) | Kilome | **Machakos Town** |
+  | Koyonzo | Busia | Butula | **Matungu** |
+  | Shinoyi-Shikomari-Esumeiya | Kakamega | Lurambi | **Navakholo** |
+  | Upper Savannah | Nairobi | Embakasi Central | **Embakasi East** |
+
+  Kalama is the only one that also crosses a *county* line, which
+  `resolveManualCorrection` now supports (it used to only search the
+  ward's current county's constituencies; the correction table is small
+  and each entry individually verified, so searching nationally by name
+  is safe here in a way blanket fuzzy-matching wouldn't be).
+
+- **Source-data ward mislabeled, not misassigned (1 ward, fixed):** the
+  raw wards.zip contains two separate features both literally named
+  "Kisii Central Ward" in Kisii county — the genuine Nyaribari Chache ward
+  of that name, and a second whose own `subcounty` attribute reads "Kitutu
+  Chache South Sub County", not "Nyaribari Chache". The 2022 list has
+  exactly one "Kisii Central" ward nationally (Nyaribari Chache) and lists
+  Kitutu Chache South's 5th ward as "Kitutu Central" — missing from this
+  dataset until this fix, since nothing was named that. Ward name alone
+  can't disambiguate the two identically-named features, so this fix is
+  keyed on the source's own `subcounty` attribute instead (hardcoded
+  directly in `scripts/build-data.mjs`'s ward-assignment loop, not in
+  `MANUAL_WARD_CORRECTIONS`, since that table is keyed by name only).
+
+- **Genuinely unresolved (2 wards + 2 official wards, left as-is):** no
+  confident match exists anywhere, checked both within the claimed
+  constituency and nationally:
+  - **"Bulla Mpya"** (assigned to Mandera East) has no close match
+    anywhere in the 2022 list. Kept, with a fallback code (see below).
+  - **"Terik"** (assigned to Kisumu East) exactly matches the *name* of an
+    official ward — but that official "Terik" (CAW 0756) is in **Aldai**
+    (Nandi county), nowhere near Kisumu East. Almost certainly two
+    unrelated real places that happen to share a name, not the same ward
+    — reassigning it to Aldai would move the wrong geometry across two
+    counties. Kept in Kisumu East with a fallback code.
+  - Consequently, **two official CAWs have no distinct polygon in this
+    dataset at all**: "Sala" (Lafey, CAW 0216) and the real "Terik"
+    (Aldai, CAW 0756). Every constituency's ward composition was checked
+    and neither ward is hiding under a misspelled name nearby — their
+    area most likely got silently absorbed into a neighbouring ward's
+    polygon somewhere in the original Red Cross digitization. This is a
+    genuine small gap in the underlying *geometry* source (1,450 named
+    official wards, but not quite 1,450 of our polygons correspond 1:1
+    to them), not something a rename/reassignment can fix.
+
+  The 2 wards above without an official match keep their source name and
+  get a **non-collision-safe fallback code**, prefixed `X` (e.g. `X001`)
+  instead of a 4-digit number — deliberately outside the real 4-digit CAW
+  code space, so nothing mistakes them for a real code when joining
+  against external IEBC-coded data. Assigned in name-sorted order, so
+  they're stable across pipeline runs but carry no meaning otherwise.
+
+**On "missing" wards, updated:** the original ~106 name-matching misses
+(from the paragraph above) are now fully resolved by the matching pipeline
+in this section — only the 2 (Bulla Mpya, Terik) just described remain
+genuinely unmatched, down from ~106. See the pipeline's console output
+(`npm run data`) for the current full match/mismatch report on every run.
+
+## Contiguity check
+
+Since counties/constituencies are dissolved fresh from the (corrected) ward
+assignments on *every* pipeline run (see "Why counties and constituencies
+are built by dissolving wards" above), every correction described in this
+document is automatically reflected in the shipped shapes — there's no
+separate "re-dissolve" step to remember to run, and no risk of a shape
+going stale relative to the ward-level fixes above.
+
+The pipeline also checks every dissolved county/constituency for whether it
+came out as more than one disconnected polygon (`MultiPolygon` with >1
+part) — printed on every run as step 7b. Most of Kenya's counties and
+constituencies are a single contiguous area, so a split is worth a look,
+though a genuine one isn't necessarily wrong (real islands exist). Last
+run found 6 counties and 12 constituencies split:
+
+| Area | Parts | Likely explanation |
+|---|---|---|
+| Lamu (county), Lamu East, Lamu West | 17, 13, 5 | Genuine — the Lamu archipelago (Manda, Pate, Kiwayu, and other islands) |
+| Homa Bay (county), Suba North, Suba South | 6, 4, 3 | Genuine — Lake Victoria islands (Mfangano, Rusinga, and others) |
+| Mombasa (county), Kisauni | 4, 2 | Genuine — Mombasa Island plus mainland areas, separated by creeks |
+| Kilifi (county), Kilifi North, Magarini | 3, 3, 2 | Plausible — coastal creeks; not individually verified |
+| Siaya (county), Bondo | 4, 4 | Plausible — Lake Victoria shoreline/peninsulas; not individually verified |
+| Kwale (county), Msambweni, Lungalunga | 4, 2, 3 | Plausible — coastal creeks; not individually verified |
+| South Imenti | 2 | Traced and explained — see below |
+| Moiben | 2 | Traced and explained — see below |
+
+South Imenti and Moiben were checked individually — both ward compositions
+were independently confirmed against official sources (matching the 2022
+list exactly, no unresolved or misassigned wards), so neither split is a
+data-*assignment* bug. Traced further, both come from a single ward each
+whose geometry is already a 2-part `MultiPolygon` **in the raw Red Cross
+wards.zip source itself**, before this pipeline touches it:
+
+- **Moiben: Kimumu ward.** One of its two raw parts has an area of
+  ~6×10⁻¹⁴ (degrees²) — a 4-6 vertex speck with no meaningful size,
+  effectively a single point. This is a harmless digitizing artifact in
+  the source data (a stray micro-polygon bundled into Kimumu's shape,
+  invisible at any real zoom level), not a second landmass.
+- **South Imenti: Nkuene ward.** Both of its two raw parts have
+  substantial, comparable area — not a speck. Plotted against its
+  neighbours, one part sits naturally against Abogeta West as expected;
+  the other is a separate, elongated shape further northwest. Checked
+  directly: its closest vertex to Abogeta West's boundary is **~26
+  metres away** — i.e. it does spatially connect to the rest of the
+  constituency, just through a near-single-point pinch too narrow for
+  mapshaper's dissolve (which merges along *shared edges*, not points)
+  to join into one ring. Whether that ~26m gap is a real narrow
+  land connection or sits within this source's digitizing precision
+  isn't something this investigation can settle, but it rules out the
+  "corrupt/misplaced geometry" explanation — the shape is exactly where
+  it should be relative to its neighbours, just barely disconnected by
+  mapshaper's topology rules.
+
+Both are pre-existing properties of the Red Cross source geometry, not
+something introduced by this pipeline's simplify/dissolve/clean steps —
+confirmed by checking the same wards' geometry straight out of
+`wards.zip`, before any processing. Left as-is: harmless in Moiben's case,
+and in South Imenti's case, correcting it would mean guessing at a
+boundary this dataset doesn't actually contain.
 
 ## Known data quality quirks
 
@@ -186,13 +500,23 @@ constituency codes.
   slivers first) eliminates this — the pipeline does
   `-clean -simplify 10% keep-shapes -clean` on the ward layer before
   dissolving it up.
-- **Misspelled names in the source.** Two are known: the county spelled
-  "ELEGEYO-MARAKWET" (commonly spelled "Elgeyo-Marakwet"), and the
-  constituency spelled "WEBUTE WEST" (should be "Webuye West" — its
-  neighbour in the same file is correctly spelled "Webuye East"). The
-  pipeline only fixes casing/spacing, never spelling, so both are shipped
-  as-is — correct them in the pipeline if you'd rather ship the common
-  spelling.
+- **Misspelled county name in the source.** The county is spelled
+  "ELEGEYO-MARAKWET" (commonly spelled "Elgeyo-Marakwet"). Counties don't
+  get the same official-spelling treatment as constituencies/wards (see
+  "Every feature's properties..." above) — that item is scoped to
+  constituencies and wards only — so this ships as-is; a small alias
+  (`NAME_ALIASES` in `scripts/build-data.mjs`) lets the pipeline's code
+  -verification step still recognise it as Elgeyo-Marakwet without
+  changing the shipped name. Correct it directly in the pipeline if you'd
+  rather ship the common spelling. (The equivalent constituency-level typo,
+  "WEBUTE WEST", *is* corrected, along with every other constituency name —
+  see "How wards are linked to constituencies" above.)
+- **Two wards in the source shapefile share a name across different
+  constituencies of the same county, and one is mislabeled.** See "Adopting
+  official IEBC ward codes and names" above — "Kisii Central" appears
+  twice in Kisii county; one of the two is actually "Kitutu Central" per
+  its own `subcounty` attribute and the 2022 official list, and is
+  corrected accordingly.
 - **Ward name "Ward" suffix.** 1,364 of 1,450 source ward names end in
   " Ward" (e.g. "Airport Ward"), which the pipeline strips as redundant
   (each feature already has `level: "ward"`). A handful of names don't have
@@ -223,15 +547,26 @@ boundaries.
 ## Verified output
 
 Last verified run: 47 counties / 290 constituencies / 1,450 wards (exact,
-no mismatches), zero unrepaired topology intersections.
+no mismatches), zero unrepaired topology intersections. All 47 county and
+290 constituency codes verified against official IEBC numbering. 1,448 of
+1,450 wards carry an official IEBC CAW code (12 by elimination); 2 keep a
+non-collision-safe fallback `X` code (see "Adopting official IEBC ward
+codes and names" above for the full methodology, the 6 constituency
+reassignments and 1 source-data mislabel it found and fixed, and exactly
+which 2 wards — and 2 official wards with no corresponding polygon at
+all — remain unresolved). 6 counties / 12 constituencies came out as
+multiple disconnected polygons; most are plausibly-to-genuinely real
+(islands/creeks), and the 2 landlocked cases (South Imenti, Moiben) were
+traced to pre-existing multi-part ward geometry in the raw source itself,
+not a pipeline or assignment bug — see "Contiguity check" above.
 
 | File | Raw | Gzipped |
 |---|---|---|
-| `counties.topojson` | 86.7 KB | 28 KB |
-| `constituencies.topojson` | 213.4 KB | 65 KB |
-| `wards/*.topojson` (47 files) | 638.6 KB | 206 KB |
-| `codes.json` | 220.8 KB | 17 KB |
-| **Total** | **~1.16 MB** | **~316 KB** |
+| `counties.topojson` | 86 KB | 28 KB |
+| `constituencies.topojson` | 213 KB | 66 KB |
+| `wards/*.topojson` (47 files) | 638 KB | 205 KB |
+| `codes.json` | 225 KB | 22 KB |
+| **Total** | **~1.16 MB** | **~321 KB** |
 
 Initial load (`counties.topojson` alone, what jsDelivr actually serves —
 it compresses on the fly): **28 KB gzipped**, comfortably under the ~100 KB
@@ -239,6 +574,10 @@ target.
 
 ## Re-running the pipeline
 
-`npm run data` downloads the three source zips into `data/raw/` (skipped if
-already present — delete `data/raw/*.zip` to force a re-download), then
-regenerates every file in this folder. `data/raw/` is git-ignored.
+`npm run data` downloads the four source zips into `data/raw/` (skipped if
+already present — delete `data/raw/*.zip` to force a re-download), reads
+the committed reference file in `data/reference/` (see that folder's own
+README — it isn't downloaded, and isn't git-ignored), then regenerates
+every file in this folder. `data/raw/` is git-ignored; `data/reference/`
+is not, so a clean clone can rebuild everything without needing to track
+down the reference file separately.

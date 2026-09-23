@@ -149,4 +149,6 @@ vite.config.ts.timestamp-*
 
 # Raw boundary downloads used by the data pipeline (Phase 2) — large,
 # re-downloadable, and not needed once data/*.topojson is generated.
+# data/reference/ is NOT covered by this rule (see below) — it holds
+# reference material that isn't re-downloadable and must stay committed.
 data/raw/

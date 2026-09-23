@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type RefObject } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject } from "react";
 import { select } from "d3-selection";
 import { zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom";
 import type { GeoPath } from "d3-geo";
@@ -6,7 +6,16 @@ import type { GeoPath } from "d3-geo";
 import { useTopoJson } from "./useTopoJson";
 import { useMapMeta } from "./useMeta";
 import { createPathGenerator, createProjection, maxZoomForBBox, tweenZoomTo, zoomTransformForBounds } from "./geo";
-import type { AreaLevel, RawAreaProperties, Selection } from "./types";
+import {
+  accumulateKnownWardCodes,
+  buildColorLookup,
+  buildPopupValues,
+  warnUnmatchedCodes,
+  type Dataset,
+  type DatasetPopupValue,
+} from "./datasets";
+import { DatasetSwitcher, Legend } from "./DatasetControls";
+import type { AreaFeature, AreaLevel, RawAreaProperties, Selection } from "./types";
 
 export interface KenyaMapProps {
   /**
@@ -19,6 +28,32 @@ export interface KenyaMapProps {
   selection?: Selection;
   /** Called whenever the drill-down selection changes, whether the change came from a click, the breadcrumb, the reset button, or Escape. */
   onSelect?: (selection: Selection) => void;
+  /**
+   * Any number of choropleth datasets. Only one colors the map at a time
+   * (see `activeDatasetId`), and only while the map is showing that
+   * dataset's own `level` — areas at other levels get a neutral fill.
+   * Also what a popup's `values` are built from (see `renderPopup`),
+   * regardless of which one is currently active.
+   */
+  datasets?: Dataset[];
+  /** Controls which dataset colors the map. Omit for uncontrolled (defaults to the first dataset in `datasets`). */
+  activeDatasetId?: string;
+  /** Called when the active dataset changes, whether from the built-in switcher or (in controlled mode) needed to let the parent update `activeDatasetId`. */
+  onDatasetChange?: (id: string) => void;
+  /** Renders a small built-in control for picking the active dataset. Ignored if `datasets` is empty. */
+  showDatasetSwitcher?: boolean;
+  /** Renders a small built-in legend for the active dataset's gradient or categories. Ignored if there's no active dataset. */
+  showLegend?: boolean;
+  /**
+   * Clicking an area always both drills down (as in the uncontrolled
+   * drill-down behavior) and opens a popup for that area, anchored to
+   * it. `values` has one entry per configured dataset (keyed by its
+   * `id`), `undefined` where that dataset doesn't apply at this area's
+   * level or has no value for its code. Omit for a sensible default
+   * popup: the area's name plus every dataset's label and formatted
+   * value (or "No data").
+   */
+  renderPopup?: (area: AreaFeature, values: Record<string, DatasetPopupValue | undefined>) => ReactNode;
   className?: string;
   style?: CSSProperties;
 }
@@ -56,10 +91,22 @@ function findFeature(
   return collection.features.find((f) => areaProps(f).code === code);
 }
 
+function toAreaFeature(feature: GeoJSON.Feature, level: AreaLevel): AreaFeature {
+  const p = areaProps(feature);
+  return { code: p.code, name: p.name, level, countyCode: p.county_code, constituencyCode: p.constituency_code };
+}
+
 interface HoverInfo {
   name: string;
   x: number;
   y: number;
+}
+
+interface PopupState {
+  area: AreaFeature;
+  /** The clicked area's centroid in path-space (untransformed) — screen position is `transform.apply([cx, cy])`, recomputed every render, so the popup stays glued to the area through the zoom-in tween and any further pan/zoom. */
+  cx: number;
+  cy: number;
 }
 
 function AreaLayer({
@@ -67,6 +114,7 @@ function AreaLayer({
   path,
   opacity,
   focusable,
+  getFill,
   onHover,
   onLeave,
   onActivate,
@@ -81,6 +129,8 @@ function AreaLayer({
    * unfaded layer — faded areas stay reachable by mouse only.
    */
   focusable: boolean;
+  /** Per-area fill, from the active dataset's color lookup. Omitted (falls back to the CSS custom property) when no dataset applies at this layer's level. */
+  getFill?: (code: string) => string;
   onHover: (name: string, clientX: number, clientY: number) => void;
   onLeave: () => void;
   onActivate: (feature: GeoJSON.Feature) => void;
@@ -96,13 +146,13 @@ function AreaLayer({
             key={properties.code}
             className="kenya-map-area"
             d={d}
-            fill="var(--kenya-map-fill, #d4d4d8)"
+            fill={getFill ? getFill(properties.code) : "var(--kenya-map-fill, #d4d4d8)"}
             stroke="var(--kenya-map-stroke, #71717a)"
             strokeWidth={0.75}
             tabIndex={focusable ? 0 : -1}
             role="button"
             aria-label={properties.name}
-            style={{ cursor: "pointer", outline: "none" }}
+            style={{ cursor: "pointer", outline: "none", transition: "fill 200ms ease" }}
             onMouseEnter={(event) => onHover(properties.name, event.clientX, event.clientY)}
             onMouseMove={(event) => onHover(properties.name, event.clientX, event.clientY)}
             onMouseLeave={onLeave}
@@ -122,6 +172,74 @@ function AreaLayer({
         );
       })}
     </g>
+  );
+}
+
+function Popup({ x, y, onClose, children }: { x: number; y: number; onClose: () => void; children: ReactNode }) {
+  return (
+    <div
+      role="dialog"
+      aria-label="Area details"
+      style={{
+        position: "absolute",
+        left: x,
+        top: y,
+        transform: "translate(-50%, calc(-100% - 10px))",
+        zIndex: 3,
+        background: "var(--kenya-map-popup-bg, #fff)",
+        color: "var(--kenya-map-popup-color, inherit)",
+        border: "1px solid var(--kenya-map-stroke, #71717a)",
+        borderRadius: 6,
+        padding: "8px 28px 8px 10px",
+        fontFamily: "sans-serif",
+        fontSize: 13,
+        boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
+        maxWidth: 240,
+      }}
+    >
+      <button
+        type="button"
+        onClick={onClose}
+        aria-label="Close"
+        style={{
+          position: "absolute",
+          top: 4,
+          right: 6,
+          border: "none",
+          background: "none",
+          cursor: "pointer",
+          font: "inherit",
+          fontSize: 16,
+          lineHeight: 1,
+          padding: 4,
+          color: "inherit",
+        }}
+      >
+        ×
+      </button>
+      {children}
+    </div>
+  );
+}
+
+function DefaultPopupContent({
+  area,
+  values,
+  datasets,
+}: {
+  area: AreaFeature;
+  values: Record<string, DatasetPopupValue | undefined>;
+  datasets: Dataset[];
+}) {
+  return (
+    <div>
+      <div style={{ fontWeight: 600, marginBottom: datasets.length ? 4 : 0 }}>{area.name}</div>
+      {datasets.map((dataset) => (
+        <div key={dataset.id}>
+          {dataset.label}: {values[dataset.id]?.formatted ?? "No data"}
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -184,6 +302,70 @@ export function KenyaMap(props: KenyaMapProps) {
     return wardsState.data.features.filter((f) => areaProps(f).constituency_code === selection.constituency);
   }, [wardsState, selection.constituency]);
 
+  // Which level is on screen right now — not the same as `selection` having
+  // a `ward` set: once a constituency is picked, its wards are what's
+  // showing, whether or not one of them is itself selected yet.
+  const currentLevel: AreaLevel = !selection.county ? "county" : !selection.constituency ? "constituency" : "ward";
+
+  const datasets = props.datasets;
+  const [internalActiveDatasetId, setInternalActiveDatasetId] = useState<string | undefined>(() => datasets?.[0]?.id);
+  const isDatasetControlled = props.activeDatasetId !== undefined;
+  const activeDatasetId = isDatasetControlled ? props.activeDatasetId : internalActiveDatasetId;
+  const onDatasetChangeRef = useRef(props.onDatasetChange);
+  onDatasetChangeRef.current = props.onDatasetChange;
+  const setActiveDatasetId = useCallback(
+    (id: string) => {
+      if (!isDatasetControlled) setInternalActiveDatasetId(id);
+      onDatasetChangeRef.current?.(id);
+    },
+    [isDatasetControlled],
+  );
+  // Covers datasets arriving after mount (e.g. the consumer's own async
+  // fetch) in uncontrolled mode — without this, a `datasets` prop that's
+  // empty on first render would leave no dataset ever active, since the
+  // `useState` initializer above only runs once. Skipped once the visitor
+  // (or the consumer, in controlled mode) has actually picked one.
+  useEffect(() => {
+    if (!isDatasetControlled && internalActiveDatasetId === undefined && datasets && datasets.length > 0) {
+      setInternalActiveDatasetId(datasets[0].id);
+    }
+  }, [isDatasetControlled, internalActiveDatasetId, datasets]);
+
+  const activeDataset = datasets?.find((d) => d.id === activeDatasetId);
+  // Rebuilding this touches every one of the dataset's values to compute
+  // its color domain, so it's worth memoizing rather than doing that on
+  // every area while rendering the layer below.
+  const colorLookup = useMemo(() => (activeDataset ? buildColorLookup(activeDataset) : null), [activeDataset]);
+
+  // Dev-only: warn about dataset values whose code matches no area this
+  // component currently knows about. County/constituency datasets can be
+  // checked exhaustively (both files load in full); a ward-level dataset
+  // can only be checked against whichever counties' wards have loaded so
+  // far this session — see warnUnmatchedCodes.
+  useEffect(() => {
+    if (!datasets) return;
+    const codes = new Set(countyFeatures.map((f) => areaProps(f).code));
+    for (const dataset of datasets) {
+      if (dataset.level === "county") warnUnmatchedCodes(dataset, codes, "exact");
+    }
+  }, [datasets, countyFeatures]);
+  useEffect(() => {
+    if (!datasets || constituenciesState.status !== "ready") return;
+    const codes = new Set(constituenciesState.data.features.map((f) => areaProps(f).code));
+    for (const dataset of datasets) {
+      if (dataset.level === "constituency") warnUnmatchedCodes(dataset, codes, "exact");
+    }
+  }, [datasets, constituenciesState]);
+  useEffect(() => {
+    if (!datasets || wardsState.status !== "ready") return;
+    const known = accumulateKnownWardCodes(wardsState.data.features);
+    for (const dataset of datasets) {
+      if (dataset.level === "ward") {
+        warnUnmatchedCodes(dataset, known, "wards load per-county, so this may just not be visited yet");
+      }
+    }
+  }, [datasets, wardsState]);
+
   const projection = useMemo(() => {
     if (countiesState.status !== "ready" || width === 0 || height === 0) return null;
     return createProjection(countiesState.data, width, height);
@@ -232,10 +414,34 @@ export function KenyaMap(props: KenyaMapProps) {
     [path, width, height, maxZoom],
   );
 
+  // Whether clicking an area should also open a popup for it — only when
+  // there's something to put in one, so a consumer who hasn't touched any
+  // Phase 4 props sees exactly the Phase 3 click behavior (drill down,
+  // nothing else).
+  const popupsEnabled = Boolean(props.renderPopup) || Boolean(datasets && datasets.length > 0);
+  const [popup, setPopup] = useState<PopupState | null>(null);
+  const closePopup = useCallback(() => setPopup(null), []);
+
+  // Closes the popup on a click anywhere outside this component. A click
+  // on an area (which opens/replaces the popup) is *inside* the
+  // container, so `contains` correctly leaves it alone — this only fires
+  // for clicks on the rest of the host page.
+  useEffect(() => {
+    if (!popup) return;
+    function handleOutsideClick(event: MouseEvent) {
+      if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
+        closePopup();
+      }
+    }
+    document.addEventListener("click", handleOutsideClick);
+    return () => document.removeEventListener("click", handleOutsideClick);
+  }, [popup, closePopup]);
+
   // A click always selects the clicked area at *its own* level, regardless
   // of which layer it's in or how faded it currently is — a sibling
   // constituency, a faded county, or another ward in the same constituency
   // are all just "select this area, drop anything below it, zoom to it."
+  // With datasets/popups configured, it also opens that area's popup.
   const selectArea = useCallback(
     (feature: GeoJSON.Feature, level: AreaLevel) => {
       const p = areaProps(feature);
@@ -247,8 +453,12 @@ export function KenyaMap(props: KenyaMapProps) {
             : { county: p.county_code, constituency: p.constituency_code, ward: p.code };
       setSelection(next);
       zoomTo(feature);
+      if (popupsEnabled && path) {
+        const [cx, cy] = path.centroid(feature);
+        setPopup({ area: toAreaFeature(feature, level), cx, cy });
+      }
     },
-    [setSelection, zoomTo],
+    [setSelection, zoomTo, popupsEnabled, path],
   );
   const goToConstituency = useCallback(() => {
     if (!selection.county || !selection.constituency) return;
@@ -259,16 +469,19 @@ export function KenyaMap(props: KenyaMapProps) {
         selection.constituency,
       ),
     );
-  }, [setSelection, zoomTo, selection.county, selection.constituency, constituenciesState]);
+    closePopup();
+  }, [setSelection, zoomTo, closePopup, selection.county, selection.constituency, constituenciesState]);
   const goToCounty = useCallback(() => {
     if (!selection.county) return;
     setSelection({ county: selection.county });
     zoomTo(findFeature(countiesState.status === "ready" ? countiesState.data : undefined, selection.county));
-  }, [setSelection, zoomTo, selection.county, countiesState]);
+    closePopup();
+  }, [setSelection, zoomTo, closePopup, selection.county, countiesState]);
   const goToCountry = useCallback(() => {
     setSelection({});
     zoomTo(undefined);
-  }, [setSelection, zoomTo]);
+    closePopup();
+  }, [setSelection, zoomTo, closePopup]);
   const goUp = useCallback(() => {
     if (selection.ward) goToConstituency();
     else if (selection.constituency) goToCounty();
@@ -291,6 +504,15 @@ export function KenyaMap(props: KenyaMapProps) {
     selection.constituency,
   )?.properties?.name as string | undefined;
 
+  const popupValues = useMemo(
+    () => (popup ? buildPopupValues(popup.area, datasets ?? []) : {}),
+    [popup, datasets],
+  );
+  // Screen position each render, from the transform in effect right now —
+  // this is what keeps the popup glued to its area through the zoom-in
+  // tween and any further pan/zoom, see PopupState's cx/cy comment.
+  const [popupScreenX, popupScreenY] = popup ? transform.apply([popup.cx, popup.cy]) : [0, 0];
+
   return (
     <div
       ref={containerRef}
@@ -299,7 +521,10 @@ export function KenyaMap(props: KenyaMapProps) {
       onKeyDown={(event) => {
         if (event.key === "Escape") {
           event.preventDefault();
-          goUp();
+          // Escape closes the topmost thing first: an open popup, then
+          // (on a second press) steps up a drill-down level.
+          if (popup) closePopup();
+          else goUp();
         }
       }}
     >
@@ -351,6 +576,22 @@ export function KenyaMap(props: KenyaMapProps) {
           </button>
         )}
       </div>
+
+      {props.showDatasetSwitcher && datasets && datasets.length > 0 && (
+        <div style={{ position: "absolute", top: 8, right: 8, zIndex: 1 }}>
+          <DatasetSwitcher
+            datasets={datasets}
+            activeDatasetId={activeDatasetId}
+            currentLevel={currentLevel}
+            onChange={setActiveDatasetId}
+          />
+        </div>
+      )}
+      {props.showLegend && activeDataset && (
+        <div style={{ position: "absolute", bottom: 8, right: 8, zIndex: 1 }}>
+          <Legend dataset={activeDataset} />
+        </div>
+      )}
 
       {countiesState.status === "loading" && <LayerMessage>Loading map…</LayerMessage>}
       {countiesState.status === "error" && (
@@ -413,7 +654,10 @@ export function KenyaMap(props: KenyaMapProps) {
               const moved = start ? Math.hypot(event.clientX - start.x, event.clientY - start.y) : 0;
               // Distinguish a genuine click on empty space from the mouseup
               // that ends a pan/zoom drag — both fire a click event here.
-              if (moved < 4) goUp();
+              if (moved < 4) {
+                closePopup();
+                goUp();
+              }
             }}
           />
           <g transform={`translate(${transform.x},${transform.y}) scale(${transform.k})`}>
@@ -422,6 +666,7 @@ export function KenyaMap(props: KenyaMapProps) {
               path={path}
               opacity={selection.county ? 0.25 : 1}
               focusable={!selection.county}
+              getFill={activeDataset?.level === "county" && colorLookup ? colorLookup : undefined}
               onHover={handleHover}
               onLeave={handleLeave}
               onActivate={(feature) => selectArea(feature, "county")}
@@ -432,6 +677,7 @@ export function KenyaMap(props: KenyaMapProps) {
                 path={path}
                 opacity={selection.constituency ? 0.25 : 1}
                 focusable={!selection.constituency}
+                getFill={activeDataset?.level === "constituency" && colorLookup ? colorLookup : undefined}
                 onHover={handleHover}
                 onLeave={handleLeave}
                 onActivate={(feature) => selectArea(feature, "constituency")}
@@ -443,6 +689,7 @@ export function KenyaMap(props: KenyaMapProps) {
                 path={path}
                 opacity={1}
                 focusable={true}
+                getFill={activeDataset?.level === "ward" && colorLookup ? colorLookup : undefined}
                 onHover={handleHover}
                 onLeave={handleLeave}
                 onActivate={(feature) => selectArea(feature, "ward")}
@@ -471,6 +718,16 @@ export function KenyaMap(props: KenyaMapProps) {
         >
           {hover.name}
         </div>
+      )}
+
+      {popup && (
+        <Popup x={popupScreenX} y={popupScreenY} onClose={closePopup}>
+          {props.renderPopup ? (
+            props.renderPopup(popup.area, popupValues)
+          ) : (
+            <DefaultPopupContent area={popup.area} values={popupValues} datasets={datasets ?? []} />
+          )}
+        </Popup>
       )}
     </div>
   );

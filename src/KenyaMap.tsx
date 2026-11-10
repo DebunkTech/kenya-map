@@ -138,7 +138,6 @@ function AreaLayer({
   opacity,
   focusable,
   getFill,
-  selectedCode,
   onHover,
   onLeave,
   onActivate,
@@ -155,75 +154,79 @@ function AreaLayer({
   focusable: boolean;
   /** Per-area fill, from the active dataset's color lookup. Omitted (falls back to the CSS custom property) when no dataset applies at this layer's level. */
   getFill?: (code: string) => string;
-  /**
-   * The code of whichever area in *this* layer currently has an open popup
-   * (undefined if that's a different layer, or no popup is open). Rendered
-   * as a separate path OUTSIDE the dimmed group below, at full opacity —
-   * not just restyled in place — because the group's own `opacity` prop
-   * (25% once you've drilled past this layer) would otherwise multiply
-   * through any fill/stroke this area gets too, making it fade exactly as
-   * much as every undistinguished sibling around it. Pulling it out is the
-   * only way it can actually stand out while its layer is dimmed for
-   * drill-down context.
-   */
-  selectedCode?: string;
   onHover: (name: string, clientX: number, clientY: number) => void;
   onLeave: () => void;
   onActivate: (feature: GeoJSON.Feature) => void;
 }) {
-  const renderArea = (feature: GeoJSON.Feature, selected: boolean) => {
-    const properties = areaProps(feature);
-    const d = path(feature);
-    if (!d) return null;
-    // `getFill` being a function at all means a dataset applies to this
-    // *layer's level* — not that this specific feature has a real value
-    // (plenty with none still get its noData fallback from inside
-    // `getFill` itself). So a selected area with real data keeps showing
-    // it (now undimmed, which already sets it apart from the rest of its
-    // still-dimmed layer); only one with no dataset color at all gets the
-    // dedicated selected-fill.
-    const fill = getFill ? getFill(properties.code) : selected ? "var(--kenya-map-selected-fill, var(--kenya-map-focus-color, #2563eb))" : "var(--kenya-map-fill, #d4d4d8)";
-    return (
-      <path
-        key={properties.code}
-        className={selected ? "kenya-map-area kenya-map-area-selected" : "kenya-map-area"}
-        d={d}
-        fill={fill}
-        stroke={selected ? "var(--kenya-map-selected-stroke, var(--kenya-map-focus-color, #2563eb))" : "var(--kenya-map-stroke, #71717a)"}
-        strokeWidth={selected ? 2 : 0.75}
-        tabIndex={focusable ? 0 : -1}
-        role="button"
-        aria-label={properties.name}
-        aria-current={selected ? "true" : undefined}
-        style={{ cursor: "pointer", outline: "none", transition: "fill 200ms ease, stroke 200ms ease, stroke-width 200ms ease" }}
-        onMouseEnter={(event) => onHover(properties.name, event.clientX, event.clientY)}
-        onMouseMove={(event) => onHover(properties.name, event.clientX, event.clientY)}
-        onMouseLeave={onLeave}
-        onFocus={(event) => {
-          const rect = event.currentTarget.getBoundingClientRect();
-          onHover(properties.name, rect.left + rect.width / 2, rect.top + rect.height / 2);
-        }}
-        onBlur={onLeave}
-        onClick={() => onActivate(feature)}
-        onKeyDown={(event) => {
-          if (focusable && event.key === "Enter") {
-            event.preventDefault();
-            onActivate(feature);
-          }
-        }}
-      />
-    );
-  };
-
-  const selectedFeature = selectedCode !== undefined ? features.find((f) => areaProps(f).code === selectedCode) : undefined;
-
   return (
-    <>
-      <g opacity={opacity} style={{ transition: "opacity 300ms ease" }}>
-        {features.map((feature) => (selectedFeature && areaProps(feature).code === selectedCode ? null : renderArea(feature, false)))}
-      </g>
-      {selectedFeature && renderArea(selectedFeature, true)}
-    </>
+    <g opacity={opacity} style={{ transition: "opacity 300ms ease" }}>
+      {features.map((feature) => {
+        const properties = areaProps(feature);
+        const d = path(feature);
+        if (!d) return null;
+        return (
+          <path
+            key={properties.code}
+            className="kenya-map-area"
+            d={d}
+            fill={getFill ? getFill(properties.code) : "var(--kenya-map-fill, #d4d4d8)"}
+            stroke="var(--kenya-map-stroke, #71717a)"
+            strokeWidth={0.75}
+            tabIndex={focusable ? 0 : -1}
+            role="button"
+            aria-label={properties.name}
+            style={{ cursor: "pointer", outline: "none", transition: "fill 200ms ease" }}
+            onMouseEnter={(event) => onHover(properties.name, event.clientX, event.clientY)}
+            onMouseMove={(event) => onHover(properties.name, event.clientX, event.clientY)}
+            onMouseLeave={onLeave}
+            onFocus={(event) => {
+              const rect = event.currentTarget.getBoundingClientRect();
+              onHover(properties.name, rect.left + rect.width / 2, rect.top + rect.height / 2);
+            }}
+            onBlur={onLeave}
+            onClick={() => onActivate(feature)}
+            onKeyDown={(event) => {
+              if (focusable && event.key === "Enter") {
+                event.preventDefault();
+                onActivate(feature);
+              }
+            }}
+          />
+        );
+      })}
+    </g>
+  );
+}
+
+/**
+ * The area whose popup is currently open, redrawn non-interactively on top
+ * of every layer (county, constituency, *and* ward — regardless of which
+ * one this feature actually belongs to) so it's never occluded by whatever
+ * paints after its own layer in SVG's DOM-order paint model. v0.2.0 tried
+ * restyling it in place within its own layer and that failed two ways: the
+ * layer's own dimming (25% opacity once you've drilled past it) multiplied
+ * straight through any highlight styling too, and even undimmed, a
+ * constituency/ward layer drawn afterward in the same `<g>` tree still
+ * paints directly over a county-level highlight sitting underneath it.
+ * `pointer-events: none` so it never steals a click/hover from the real,
+ * interactive path underneath — this is purely a visual decal.
+ */
+function SelectedAreaHighlight({ feature, path }: { feature: GeoJSON.Feature; path: GeoPath }) {
+  const d = path(feature);
+  if (!d) return null;
+  const properties = areaProps(feature);
+  return (
+    <path
+      className="kenya-map-area-selected"
+      d={d}
+      fill="var(--kenya-map-selected-fill, var(--kenya-map-focus-color, #2563eb))"
+      stroke="var(--kenya-map-selected-stroke, var(--kenya-map-focus-color, #2563eb))"
+      strokeWidth={2.5}
+      pointerEvents="none"
+      aria-hidden="true"
+    >
+      <title>{properties.name}</title>
+    </path>
   );
 }
 
@@ -574,6 +577,16 @@ export function KenyaMap(props: KenyaMapProps) {
   const popupsEnabled = Boolean(props.renderPopup) || Boolean(datasets && datasets.length > 0);
   const [popup, setPopup] = useState<PopupState | null>(null);
   const closePopup = useCallback(() => setPopup(null), []);
+  // The actual GeoJSON feature behind the open popup, from whichever of the
+  // three collections matches its own level — looked up fresh each render
+  // rather than kept on `popup` itself, since `popup` is set once (on
+  // click) but `countyFeatures`/`constituencyFeatures`/`wardFeatures` can
+  // still change identity later (e.g. wards load in asynchronously).
+  const selectedFeature = useMemo(() => {
+    if (!popup) return undefined;
+    const collection = popup.area.level === "county" ? countyFeatures : popup.area.level === "constituency" ? constituencyFeatures : wardFeatures;
+    return collection.find((f) => areaProps(f).code === popup.area.code);
+  }, [popup, countyFeatures, constituencyFeatures, wardFeatures]);
 
   // Closes the popup on a click anywhere outside this component. A click
   // on an area (which opens/replaces the popup) is *inside* the
@@ -851,7 +864,6 @@ export function KenyaMap(props: KenyaMapProps) {
               opacity={selection.county ? 0.25 : 1}
               focusable={!selection.county}
               getFill={activeDataset?.level === "county" && colorLookup ? colorLookup : undefined}
-              selectedCode={popup?.area.level === "county" ? popup.area.code : undefined}
               onHover={handleHover}
               onLeave={handleLeave}
               onActivate={(feature) => selectArea(feature, "county")}
@@ -863,7 +875,6 @@ export function KenyaMap(props: KenyaMapProps) {
                 opacity={selection.constituency ? 0.25 : 1}
                 focusable={!selection.constituency}
                 getFill={activeDataset?.level === "constituency" && colorLookup ? colorLookup : undefined}
-                selectedCode={popup?.area.level === "constituency" ? popup.area.code : undefined}
                 onHover={handleHover}
                 onLeave={handleLeave}
                 onActivate={(feature) => selectArea(feature, "constituency")}
@@ -876,12 +887,12 @@ export function KenyaMap(props: KenyaMapProps) {
                 opacity={1}
                 focusable={true}
                 getFill={activeDataset?.level === "ward" && colorLookup ? colorLookup : undefined}
-                selectedCode={popup?.area.level === "ward" ? popup.area.code : undefined}
                 onHover={handleHover}
                 onLeave={handleLeave}
                 onActivate={(feature) => selectArea(feature, "ward")}
               />
             )}
+            {selectedFeature && <SelectedAreaHighlight feature={selectedFeature} path={path} />}
           </g>
           {pointLayers && pointLayers.length > 0 && projection && (
             <PointMarkers

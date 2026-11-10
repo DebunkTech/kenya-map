@@ -1,6 +1,6 @@
 {
   "name": "@debunktech/kenya-map",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Interactive drill-down map of Kenya's counties, constituencies and wards for React",
   "license": "MIT",
   "type": "module",

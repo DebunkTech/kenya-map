@@ -138,6 +138,7 @@ function AreaLayer({
   opacity,
   focusable,
   getFill,
+  selectedCode,
   onHover,
   onLeave,
   onActivate,
@@ -154,6 +155,15 @@ function AreaLayer({
   focusable: boolean;
   /** Per-area fill, from the active dataset's color lookup. Omitted (falls back to the CSS custom property) when no dataset applies at this layer's level. */
   getFill?: (code: string) => string;
+  /**
+   * The code of whichever area in *this* layer currently has an open popup
+   * (undefined if that's a different layer, or no popup is open) — without
+   * this, the area a popup describes has no visual tie to it once you've
+   * drilled past it into a fainter layer, where it's otherwise
+   * indistinguishable from any sibling. Stroke always gets the highlight
+   * treatment; fill only does when there's no dataset color to preserve.
+   */
+  selectedCode?: string;
   onHover: (name: string, clientX: number, clientY: number) => void;
   onLeave: () => void;
   onActivate: (feature: GeoJSON.Feature) => void;
@@ -164,18 +174,25 @@ function AreaLayer({
         const properties = areaProps(feature);
         const d = path(feature);
         if (!d) return null;
+        const isSelected = selectedCode !== undefined && properties.code === selectedCode;
+        const fill = getFill
+          ? getFill(properties.code)
+          : isSelected
+            ? "var(--kenya-map-selected-fill, var(--kenya-map-focus-color, #2563eb))"
+            : "var(--kenya-map-fill, #d4d4d8)";
         return (
           <path
             key={properties.code}
-            className="kenya-map-area"
+            className={isSelected ? "kenya-map-area kenya-map-area-selected" : "kenya-map-area"}
             d={d}
-            fill={getFill ? getFill(properties.code) : "var(--kenya-map-fill, #d4d4d8)"}
-            stroke="var(--kenya-map-stroke, #71717a)"
-            strokeWidth={0.75}
+            fill={fill}
+            stroke={isSelected ? "var(--kenya-map-selected-stroke, var(--kenya-map-focus-color, #2563eb))" : "var(--kenya-map-stroke, #71717a)"}
+            strokeWidth={isSelected ? 2 : 0.75}
             tabIndex={focusable ? 0 : -1}
             role="button"
             aria-label={properties.name}
-            style={{ cursor: "pointer", outline: "none", transition: "fill 200ms ease" }}
+            aria-current={isSelected ? "true" : undefined}
+            style={{ cursor: "pointer", outline: "none", transition: "fill 200ms ease, stroke 200ms ease, stroke-width 200ms ease" }}
             onMouseEnter={(event) => onHover(properties.name, event.clientX, event.clientY)}
             onMouseMove={(event) => onHover(properties.name, event.clientX, event.clientY)}
             onMouseLeave={onLeave}
@@ -822,6 +839,7 @@ export function KenyaMap(props: KenyaMapProps) {
               opacity={selection.county ? 0.25 : 1}
               focusable={!selection.county}
               getFill={activeDataset?.level === "county" && colorLookup ? colorLookup : undefined}
+              selectedCode={popup?.area.level === "county" ? popup.area.code : undefined}
               onHover={handleHover}
               onLeave={handleLeave}
               onActivate={(feature) => selectArea(feature, "county")}
@@ -833,6 +851,7 @@ export function KenyaMap(props: KenyaMapProps) {
                 opacity={selection.constituency ? 0.25 : 1}
                 focusable={!selection.constituency}
                 getFill={activeDataset?.level === "constituency" && colorLookup ? colorLookup : undefined}
+                selectedCode={popup?.area.level === "constituency" ? popup.area.code : undefined}
                 onHover={handleHover}
                 onLeave={handleLeave}
                 onActivate={(feature) => selectArea(feature, "constituency")}
@@ -845,6 +864,7 @@ export function KenyaMap(props: KenyaMapProps) {
                 opacity={1}
                 focusable={true}
                 getFill={activeDataset?.level === "ward" && colorLookup ? colorLookup : undefined}
+                selectedCode={popup?.area.level === "ward" ? popup.area.code : undefined}
                 onHover={handleHover}
                 onLeave={handleLeave}
                 onActivate={(feature) => selectArea(feature, "ward")}

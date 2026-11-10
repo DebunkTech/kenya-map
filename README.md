@@ -218,6 +218,8 @@ element (or `:root` for a global default):
 | `--kenya-map-tooltip-color` | Hover tooltip text | `#fff` |
 | `--kenya-map-popup-bg` | Area/point popup background | `#fff` |
 | `--kenya-map-popup-color` | Area/point popup text | `inherit` |
+| `--kenya-map-selected-fill` | Fill of the area whose popup is currently open, only when no dataset already colors it (a dataset color is never overridden) | `var(--kenya-map-focus-color, #2563eb)` |
+| `--kenya-map-selected-stroke` | Stroke (always, at 2px instead of 0.75px) of the area whose popup is currently open | `var(--kenya-map-focus-color, #2563eb)` |
 
 ```css
 :root {

@@ -157,61 +157,73 @@ function AreaLayer({
   getFill?: (code: string) => string;
   /**
    * The code of whichever area in *this* layer currently has an open popup
-   * (undefined if that's a different layer, or no popup is open) — without
-   * this, the area a popup describes has no visual tie to it once you've
-   * drilled past it into a fainter layer, where it's otherwise
-   * indistinguishable from any sibling. Stroke always gets the highlight
-   * treatment; fill only does when there's no dataset color to preserve.
+   * (undefined if that's a different layer, or no popup is open). Rendered
+   * as a separate path OUTSIDE the dimmed group below, at full opacity —
+   * not just restyled in place — because the group's own `opacity` prop
+   * (25% once you've drilled past this layer) would otherwise multiply
+   * through any fill/stroke this area gets too, making it fade exactly as
+   * much as every undistinguished sibling around it. Pulling it out is the
+   * only way it can actually stand out while its layer is dimmed for
+   * drill-down context.
    */
   selectedCode?: string;
   onHover: (name: string, clientX: number, clientY: number) => void;
   onLeave: () => void;
   onActivate: (feature: GeoJSON.Feature) => void;
 }) {
+  const renderArea = (feature: GeoJSON.Feature, selected: boolean) => {
+    const properties = areaProps(feature);
+    const d = path(feature);
+    if (!d) return null;
+    // `getFill` being a function at all means a dataset applies to this
+    // *layer's level* — not that this specific feature has a real value
+    // (plenty with none still get its noData fallback from inside
+    // `getFill` itself). So a selected area with real data keeps showing
+    // it (now undimmed, which already sets it apart from the rest of its
+    // still-dimmed layer); only one with no dataset color at all gets the
+    // dedicated selected-fill.
+    const fill = getFill ? getFill(properties.code) : selected ? "var(--kenya-map-selected-fill, var(--kenya-map-focus-color, #2563eb))" : "var(--kenya-map-fill, #d4d4d8)";
+    return (
+      <path
+        key={properties.code}
+        className={selected ? "kenya-map-area kenya-map-area-selected" : "kenya-map-area"}
+        d={d}
+        fill={fill}
+        stroke={selected ? "var(--kenya-map-selected-stroke, var(--kenya-map-focus-color, #2563eb))" : "var(--kenya-map-stroke, #71717a)"}
+        strokeWidth={selected ? 2 : 0.75}
+        tabIndex={focusable ? 0 : -1}
+        role="button"
+        aria-label={properties.name}
+        aria-current={selected ? "true" : undefined}
+        style={{ cursor: "pointer", outline: "none", transition: "fill 200ms ease, stroke 200ms ease, stroke-width 200ms ease" }}
+        onMouseEnter={(event) => onHover(properties.name, event.clientX, event.clientY)}
+        onMouseMove={(event) => onHover(properties.name, event.clientX, event.clientY)}
+        onMouseLeave={onLeave}
+        onFocus={(event) => {
+          const rect = event.currentTarget.getBoundingClientRect();
+          onHover(properties.name, rect.left + rect.width / 2, rect.top + rect.height / 2);
+        }}
+        onBlur={onLeave}
+        onClick={() => onActivate(feature)}
+        onKeyDown={(event) => {
+          if (focusable && event.key === "Enter") {
+            event.preventDefault();
+            onActivate(feature);
+          }
+        }}
+      />
+    );
+  };
+
+  const selectedFeature = selectedCode !== undefined ? features.find((f) => areaProps(f).code === selectedCode) : undefined;
+
   return (
-    <g opacity={opacity} style={{ transition: "opacity 300ms ease" }}>
-      {features.map((feature) => {
-        const properties = areaProps(feature);
-        const d = path(feature);
-        if (!d) return null;
-        const isSelected = selectedCode !== undefined && properties.code === selectedCode;
-        const fill = getFill
-          ? getFill(properties.code)
-          : isSelected
-            ? "var(--kenya-map-selected-fill, var(--kenya-map-focus-color, #2563eb))"
-            : "var(--kenya-map-fill, #d4d4d8)";
-        return (
-          <path
-            key={properties.code}
-            className={isSelected ? "kenya-map-area kenya-map-area-selected" : "kenya-map-area"}
-            d={d}
-            fill={fill}
-            stroke={isSelected ? "var(--kenya-map-selected-stroke, var(--kenya-map-focus-color, #2563eb))" : "var(--kenya-map-stroke, #71717a)"}
-            strokeWidth={isSelected ? 2 : 0.75}
-            tabIndex={focusable ? 0 : -1}
-            role="button"
-            aria-label={properties.name}
-            aria-current={isSelected ? "true" : undefined}
-            style={{ cursor: "pointer", outline: "none", transition: "fill 200ms ease, stroke 200ms ease, stroke-width 200ms ease" }}
-            onMouseEnter={(event) => onHover(properties.name, event.clientX, event.clientY)}
-            onMouseMove={(event) => onHover(properties.name, event.clientX, event.clientY)}
-            onMouseLeave={onLeave}
-            onFocus={(event) => {
-              const rect = event.currentTarget.getBoundingClientRect();
-              onHover(properties.name, rect.left + rect.width / 2, rect.top + rect.height / 2);
-            }}
-            onBlur={onLeave}
-            onClick={() => onActivate(feature)}
-            onKeyDown={(event) => {
-              if (focusable && event.key === "Enter") {
-                event.preventDefault();
-                onActivate(feature);
-              }
-            }}
-          />
-        );
-      })}
-    </g>
+    <>
+      <g opacity={opacity} style={{ transition: "opacity 300ms ease" }}>
+        {features.map((feature) => (selectedFeature && areaProps(feature).code === selectedCode ? null : renderArea(feature, false)))}
+      </g>
+      {selectedFeature && renderArea(selectedFeature, true)}
+    </>
   );
 }
 
